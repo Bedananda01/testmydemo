@@ -24,16 +24,16 @@ locals {
 }
 
 # Deploy the APIM instance using the apim module
-#module "apim" {
- # source = "./modules/apim"
+module "apim" {
+ source = "./modules/apim"
 
- # resource_group_name = data.azurerm_resource_group.existing.name
-  #location            = data.azurerm_resource_gSroup.existing.location
- # apim_name           = local.apim_name
-  #publisher_name      = var.apim_publisher_name
-  #publisher_email     = var.apim_publisher_email
- #sku_name            = var.apim_sku_nameS
-#}
+  resource_group_name = data.azurerm_resource_group.existing.name
+  location            = data.azurerm_resource_gSroup.existing.location
+  apim_name           = local.apim_name
+  publisher_name      = var.apim_publisher_name
+  publisher_email     = var.apim_publisher_email
+  sku_name            = var.apim_sku_name
+}
 
 module "api_config" {
   source = "./modules/api_config"
