@@ -1,0 +1,604 @@
+###############################################################################
+# Azure DevOps Pipeline — SCB APIM Infrastructure (PREPROD)
+#
+# This pipeline handles the PreProd environment ONLY.
+# Triggered by: develop branch pushes + PRs targeting develop
+#
+# ┌──────────────────┬──────────┬─────────────┬──────────────┐
+# │ Trigger          │ Validate │ Plan PreProd │ Deploy PreProd│
+# ├──────────────────┼──────────┼─────────────┼──────────────┤
+# │ PR → develop     │    ✅    │      ✗      │      ✗       │
+# │ develop push     │    ✅    │      ✅     │      ✅      │
+# │ feature/* push   │    ✅    │      ✗      │      ✗       │
+# │ bugfix/* push    │    ✅    │      ✗      │      ✗       │
+# └──────────────────┴──────────┴─────────────┴──────────────┘
+#
+# PREREQUISITES:
+#   1. Service Connection: "scb-preprod-sp-connection"
+#   2. Variable Group: "scb-apim-common"
+#   3. Secure File: apim-stage.pfx
+#   4. Environment: scb-apim-preprod (approver: Jake Linebaugh)
+#
+###############################################################################
+
+trigger:
+  branches:
+    include:
+      - develop
+      - feature/*
+      - bugfix/*
+  paths:
+    include:
+      - infra/environments/preprod/**
+      - infra/modules/**
+      - infra/pipelines/**
+
+pr:
+  branches:
+    include:
+      - develop
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: scb-apim-common
+  - name: terraformVersion
+    value: '1.9.5'
+  - name: serviceConnection
+    value: 'scb-preprod-sp-connection'
+  - name: workingDir
+    value: '$(System.DefaultWorkingDirectory)/infra/environments/preprod'
+  - name: isDevelop
+    value: ${{ eq(variables['Build.SourceBranch'], 'refs/heads/develop') }}
+
+###############################################################################
+# Stage 1: VALIDATE — Runs on ALL triggers (PRs + pushes)
+###############################################################################
+stages:
+  - stage: Validate
+    displayName: '🔍 Validate'
+    jobs:
+      - job: ValidateTerraform
+        displayName: 'Format Check & Validate'
+        steps:
+          - checkout: self
+
+          - script: |
+              echo "═══════════════════════════════════════════"
+              echo "  Branch:  $(Build.SourceBranch)"
+              echo "  Reason:  $(Build.Reason)"
+              echo "  Commit:  $(Build.SourceVersion)"
+              echo "═══════════════════════════════════════════"
+              curl -fsSL https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip -o /tmp/terraform.zip
+              sudo unzip -o /tmp/terraform.zip -d /usr/local/bin/
+              terraform version
+            displayName: 'Install Terraform'
+          - task: AzureCLI@2
+            displayName: 'Terraform Format Check'
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              addSpnToEnvironment: true
+              failOnStandardError: false
+              workingDirectory: $(workingDir)
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Checking Terraform format..."
+                terraform fmt -check -recursive ../../modules/ || {
+                  echo "⚠️  Format check failed. Run 'terraform fmt -recursive' locally."
+                  echo "Continuing — format issues are warnings, not blockers."
+                }
+                terraform fmt -check . || true
+
+          - task: AzureCLI@2
+            displayName: 'Terraform Validate'
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              addSpnToEnvironment: true
+              failOnStandardError: false
+              workingDirectory: $(workingDir)
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(PREPROD_SUBSCRIPTION_ID)
+
+                terraform init -backend=false
+                terraform validate
+                echo "✅ Terraform validation passed"
+
+###############################################################################
+# Stage 2: PLAN — develop branch only (not PRs, not feature branches)
+###############################################################################
+  - stage: Plan_PreProd
+    displayName: '📋 Plan PreProd'
+    dependsOn: Validate
+    condition: |
+      and(
+        succeeded(),
+        ne(variables['Build.Reason'], 'PullRequest'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/develop')
+      )
+    jobs:
+      - job: PlanPreProd
+        displayName: 'Terraform Plan — PreProd'
+        steps:
+          - checkout: self
+
+          - script: |
+              curl -fsSL https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip -o /tmp/terraform.zip
+              sudo unzip -o /tmp/terraform.zip -d /usr/local/bin/
+            displayName: 'Install Terraform'
+
+          - task: DownloadSecureFile@1
+            name: preprodCert
+            inputs:
+              secureFile: 'apim-stage.pfx'
+
+          - task: AzureCLI@2
+            displayName: 'Terraform Init & Plan'
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              addSpnToEnvironment: true
+              failOnStandardError: false
+              workingDirectory: $(workingDir)
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(PREPROD_SUBSCRIPTION_ID)
+                export TF_VAR_certificate_base64=$(base64 -w 0 $(preprodCert.secureFilePath))
+                export TF_VAR_certificate_password="$(PREPROD_CERT_PASSWORD)"
+
+                # ── Detect Agent IP & Whitelist in Key Vault ──
+                AGENT_IP=$(curl -s --retry 3 https://api.ipify.org)
+                echo "Pipeline agent public IP: $AGENT_IP"
+                export TF_VAR_deployer_ip="${AGENT_IP}/32"
+
+                # If KV already exists, enable public access with IP filter and add agent IP
+                KV_NAME="scb-preprd-eus2-kv-01"
+                KV_RG="scb-preprd-apim-eus2-rg-01"
+                if az keyvault show -n $KV_NAME -g $KV_RG --subscription $(PREPROD_SUBSCRIPTION_ID) &>/dev/null; then
+                  echo "Key Vault exists — ensuring public access enabled with firewall..."
+
+                  # Enable public access (required for IP rules to work)
+                  az keyvault update \
+                    --name $KV_NAME \
+                    --resource-group $KV_RG \
+                    --subscription $(PREPROD_SUBSCRIPTION_ID) \
+                    --public-network-access Enabled \
+                    --only-show-errors 2>/dev/null || echo "⚠️ Could not enable public access"
+
+                  # Ensure default action is Deny (only whitelisted IPs)
+                  az keyvault update \
+                    --name $KV_NAME \
+                    --resource-group $KV_RG \
+                    --subscription $(PREPROD_SUBSCRIPTION_ID) \
+                    --default-action Deny \
+                    --bypass AzureServices \
+                    --only-show-errors 2>/dev/null || true
+
+                  # Add pipeline agent IP to firewall
+                  az keyvault network-rule add \
+                    --name $KV_NAME \
+                    --resource-group $KV_RG \
+                    --subscription $(PREPROD_SUBSCRIPTION_ID) \
+                    --ip-address "${AGENT_IP}/32" \
+                    --only-show-errors 2>/dev/null || echo "⚠️ Could not add IP rule (may already exist)"
+                  echo "Waiting 30s for firewall changes to propagate..."
+                  sleep 30
+                else
+                  echo "Key Vault does not exist yet — will be created by Terraform with agent IP in firewall."
+                fi
+
+                #--- Also whitelist on CMK Key Vault ---
+                CMK_KV_NAME="scb-kv-sa-cmk"
+                CMK_KV_RG="scb-rg-mon-core-eus2"
+                CMK_KV_SUB="46175b17-22e3-4be2-9790-abe58f1a5e50"
+                if az keyvault show -n$CMK_KV_NAME -g $CMK_KV_RG --subscription $CMK_KV_SUB &>/dev/null; then
+                   echo "CMK Key Vault - adding agent IP ..."
+                   az keyvault network-rule add \
+                     --name $CMK_KV_NAME \
+                     --resource-group $CMK_KV_RG \
+                     --subscription $CMK_KV_SUB \
+                     --ip-address "${AGENT_IP}/32" \
+                     --only-show-errors 2>/dev/null || echo "Could not add CMK KV IP rule"
+                    sleep 15
+                  fi
+
+                echo "══════════════════════════════════════════════"
+                echo "  TERRAFORM INIT"
+                echo "══════════════════════════════════════════════"
+                terraform init \
+                  -backend-config=backend.tfvars \
+                  -backend-config="subscription_id=$(PREPROD_SUBSCRIPTION_ID)" \
+                  -backend-config="tenant_id=$tenantId" \
+                  -backend-config="client_id=$servicePrincipalId" \
+                  -backend-config="client_secret=$servicePrincipalKey"
+
+                chmod -R +x .terraform/providers/ 2>/dev/null || true
+
+                echo ""
+                echo "══════════════════════════════════════════════"
+                echo "  TERRAFORM PLAN"
+                echo "══════════════════════════════════════════════"
+                terraform plan -lock-timeout=300s \
+                  -var-file=terraform.tfvars \
+                  -out=preprod.tfplan
+
+                echo ""
+                echo "══════════════════════════════════════════════"
+                echo "  ✅ Plan complete — review above output"
+                echo "══════════════════════════════════════════════"
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Plan'
+            inputs:
+              targetPath: $(workingDir)/preprod.tfplan
+              artifactName: preprod-plan
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Source'
+            inputs:
+              targetPath: $(System.DefaultWorkingDirectory)
+              artifactName: source-preprod
+
+###############################################################################
+# Stage 3: DEPLOY — develop branch only (with environment approval gate)
+###############################################################################
+  - stage: Deploy_PreProd
+    displayName: '🚀 Deploy PreProd'
+    dependsOn: Plan_PreProd
+    condition: |
+      and(
+        succeeded(),
+        ne(variables['Build.Reason'], 'PullRequest'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/develop')
+      )
+    jobs:
+      - deployment: DeployPreProd
+        displayName: 'Terraform Apply — PreProd'
+        environment: 'scb-apim-preprod'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download Source'
+                  inputs:
+                    artifactName: source-preprod
+                    targetPath: $(Pipeline.Workspace)/source-preprod
+
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download Plan'
+                  inputs:
+                    artifactName: preprod-plan
+                    targetPath: $(Pipeline.Workspace)/preprod-plan
+
+                - script: |
+                    curl -fsSL https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip -o /tmp/terraform.zip
+                    sudo unzip -o /tmp/terraform.zip -d /usr/local/bin/
+                  displayName: 'Install Terraform'
+
+                - task: DownloadSecureFile@1
+                  name: preprodCert
+                  inputs:
+                    secureFile: 'apim-stage.pfx'
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Init & Apply'
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    addSpnToEnvironment: true
+                    failOnStandardError: false
+                    workingDirectory: $(Pipeline.Workspace)/source-preprod/infra/environments/preprod
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+
+                      export ARM_CLIENT_ID=$servicePrincipalId
+                      export ARM_CLIENT_SECRET=$servicePrincipalKey
+                      export ARM_TENANT_ID=$tenantId
+                      export ARM_SUBSCRIPTION_ID=$(PREPROD_SUBSCRIPTION_ID)
+                      export TF_VAR_certificate_base64=$(base64 -w 0 $(preprodCert.secureFilePath))
+                      export TF_VAR_certificate_password="$(PREPROD_CERT_PASSWORD)"
+
+                      # ── Detect Agent IP & Whitelist in Key Vault ──
+                      AGENT_IP=$(curl -s --retry 3 https://api.ipify.org)
+                      echo "Pipeline agent public IP: $AGENT_IP"
+                      export TF_VAR_deployer_ip="${AGENT_IP}/32"
+
+                      KV_NAME="scb-preprd-eus2-kv-01"
+                      KV_RG="scb-preprd-apim-eus2-rg-01"
+                      if az keyvault show -n $KV_NAME -g $KV_RG --subscription $(PREPROD_SUBSCRIPTION_ID) &>/dev/null; then
+                        echo "Key Vault exists — ensuring public access enabled with firewall..."
+                        az keyvault update \
+                          --name $KV_NAME \
+                          --resource-group $KV_RG \
+                          --subscription $(PREPROD_SUBSCRIPTION_ID) \
+                          --public-network-access Enabled \
+                          --only-show-errors 2>/dev/null || echo "⚠️ Could not enable public access"
+                        az keyvault update \
+                          --name $KV_NAME \
+                          --resource-group $KV_RG \
+                          --subscription $(PREPROD_SUBSCRIPTION_ID) \
+                          --default-action Deny \
+                          --bypass AzureServices \
+                          --only-show-errors 2>/dev/null || true
+                        az keyvault network-rule add \
+                          --name $KV_NAME \
+                          --resource-group $KV_RG \
+                          --subscription $(PREPROD_SUBSCRIPTION_ID) \
+                          --ip-address "${AGENT_IP}/32" \
+                          --only-show-errors 2>/dev/null || echo "⚠️ Could not add IP rule (may already exist)"
+                        echo "Waiting 30s for firewall changes to propagate..."
+                        sleep 30
+                      fi
+
+                      #--------- Alos whitelist on CMK Key Vault (shared vault for storage encryption) ---
+                      CMK_KV_NAME="scb-kv-sa-cmk"
+                      CMK_KV_RG="scb-rg-mon-core-eus2"
+                      CMK_KV_SUB="46175b17-22e3-4be2-9790-abe58f1a5e50"
+                      if az keyvault show -n$CMK_KV_NAME -g $CMK_KV_RG --subscription $CMK_KV_SUB &>/dev/null; then
+                        echo "CMK Key Vault - adding agent IP ..."
+                        az keyvault network-rule add \
+                          --name $CMK_KV_NAME \
+                          --resource-group $CMK_KV_RG \
+                          --subscription $CMK_KV_SUB \
+                          --ip-address "${AGENT_IP}/32" \
+                          --only-show-errors 2>/dev/null || echo "Could not add CMK KV IP rule"
+                          sleep 15
+                        fi
+
+
+                      echo "══════════════════════════════════════════════"
+                      echo "  TERRAFORM INIT"
+                      echo "══════════════════════════════════════════════"
+                      terraform init \
+                        -backend-config=backend.tfvars \
+                        -backend-config="subscription_id=$(PREPROD_SUBSCRIPTION_ID)" \
+                        -backend-config="tenant_id=$tenantId" \
+                        -backend-config="client_id=$servicePrincipalId" \
+                        -backend-config="client_secret=$servicePrincipalKey"
+
+                      chmod -R +x .terraform/providers/ 2>/dev/null || true
+
+                      # ── TERRAFORM APPLY WITH AUTO-IMPORT RETRY ──
+                      # If apply fails with "already exists", extract IDs, import, retry.
+                      echo ""
+                      echo "══════════════════════════════════════════════"
+                      echo "  TERRAFORM APPLY (attempt 1)"
+                      echo "══════════════════════════════════════════════"
+
+                      set +e
+                      terraform apply -auto-approve -lock-timeout=300s \
+                        -var-file=terraform.tfvars 2>&1 | tee /tmp/tf_apply_output.txt
+                      TF_EXIT=${PIPESTATUS[0]}
+                      set -e
+
+                      if [ $TF_EXIT -ne 0 ]; then
+                        echo ""
+                        echo "══════════════════════════════════════════════"
+                        echo "  APPLY FAILED — CHECKING FOR ORPHANED RESOURCES"
+                        echo "══════════════════════════════════════════════"
+
+                        # Parse "already exists" errors to extract Azure resource IDs
+                        ORPHAN_IDS=$(grep -oP 'with the ID "https://[^"]+"' /tmp/tf_apply_output.txt | \
+                          grep -oP 'https://[^"]+' || echo "")
+
+                        # Map error context to Terraform resource addresses
+                        IMPORTED=0
+                        while IFS= read -r AZURE_ID; do
+                          [ -z "$AZURE_ID" ] && continue
+                          echo "  Found orphan: $AZURE_ID"
+
+                          TF_ADDR=""
+                          if echo "$AZURE_ID" | grep -q "/certificates/"; then
+                            TF_ADDR="module.custom_domains.azurerm_key_vault_certificate.apim_cert"
+                          elif echo "$AZURE_ID" | grep -q "/keys/"; then
+                            # Strip version suffix for key import
+                            AZURE_ID=$(echo "$AZURE_ID" | sed 's|/[0-9a-f]\{20,\}$||')
+                            TF_ADDR="module.storage.azurerm_key_vault_key.cmk"
+                          fi
+
+                          if [ -n "$TF_ADDR" ]; then
+                            echo "  Importing: $TF_ADDR <- $AZURE_ID"
+                            terraform import -var-file=terraform.tfvars \
+                              "$TF_ADDR" "$AZURE_ID" 2>&1 && IMPORTED=$((IMPORTED+1)) || \
+                              echo "  ⚠️ Import failed for $TF_ADDR"
+                          fi
+                        done <<< "$ORPHAN_IDS"
+
+                        # Also check role assignment
+                        if grep -q "RoleAssignmentExists" /tmp/tf_apply_output.txt; then
+                          SPN_OID=$(az ad sp show --id $servicePrincipalId --query id -o tsv)
+                          CMK_SCOPE="/subscriptions/46175b17-22e3-4be2-9790-abe58f1a5e50/resourceGroups/scb-rg-mon-core-eus2/providers/Microsoft.KeyVault/vaults/scb-kv-sa-cmk"
+                          EXISTING_ROLE=$(az role assignment list \
+                            --assignee "$SPN_OID" \
+                            --role "Key Vault Crypto Officer" \
+                            --scope "$CMK_SCOPE" \
+                            --query "[0].id" -o tsv 2>/dev/null || echo "")
+                          if [ -n "$EXISTING_ROLE" ] && [ "$EXISTING_ROLE" != "None" ]; then
+                            terraform import -var-file=terraform.tfvars \
+                              module.storage.azurerm_role_assignment.deployer_crypto_officer \
+                              "$EXISTING_ROLE" 2>&1 && IMPORTED=$((IMPORTED+1)) || true
+                          fi
+                        fi
+
+                        if [ $IMPORTED -gt 0 ]; then
+                          echo ""
+                          echo "══════════════════════════════════════════════"
+                          echo "  TERRAFORM APPLY (attempt 2 — after import)"
+                          echo "══════════════════════════════════════════════"
+                          terraform apply -auto-approve -lock-timeout=300s \
+                            -var-file=terraform.tfvars
+                        else
+                          echo "  No orphaned resources found to import — failing."
+                          cat /tmp/tf_apply_output.txt
+                          exit 1
+                        fi
+                      fi
+
+                - task: AzureCLI@2
+                  displayName: '🔒 Remove Agent IP from Key Vault Firewall'
+                  condition: always()
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    failOnStandardError: false
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      AGENT_IP=$(curl -s --retry 3 https://api.ipify.org)
+                      KV_NAME="scb-preprd-eus2-kv-01"
+                      KV_RG="scb-preprd-apim-eus2-rg-01"
+
+                      echo "Removing agent IP ${AGENT_IP} from Key Vault firewalls..."
+                      az keyvault network-rule remove \
+                        --name $KV_NAME \
+                        --resource-group $KV_RG \
+                        --subscription $(PREPROD_SUBSCRIPTION_ID) \
+                        --ip-address "${AGENT_IP}/32" \
+                        --only-show-errors 2>/dev/null || echo "⚠️ Could not remove IP from APIM KV"
+
+                      # Also clean up CMK vault
+                      az keyvault network-rule remove \
+                        --name scb-kv-sa-cmk \
+                        --resource-group scb-rg-mon-core-eus2 \
+                        --subscription 46175b17-22e3-4be2-9790-abe58f1a5e50 \
+                        --ip-address "${AGENT_IP}/32" \
+                        --only-show-errors 2>/dev/null || echo "⚠️ Could not remove IP from CMK KV"
+                      echo "✅ Agent IP removed — Key Vaults locked down"
+
+                - task: AzureCLI@2
+                  displayName: 'Post-Deploy Validation'
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    failOnStandardError: false
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo "=== APIM Status ==="
+                      az apim show -n scb-preprd-apim-eus2-apim-01 \
+                        -g scb-preprd-apim-eus2-rg-01 \
+                        --subscription $(PREPROD_SUBSCRIPTION_ID) \
+                        --query "{name:name, status:provisioningState, privateIP:privateIpAddresses[0]}" \
+                        -o table || echo "⚠️ Could not query APIM status"
+
+                      echo ""
+                      echo "=== Private Endpoints ==="
+                      az network private-endpoint list \
+                        -g scb-preprd-apim-eus2-rg-01 \
+                        --subscription $(PREPROD_SUBSCRIPTION_ID) \
+                        --query "[].{Name:name, Status:privateLinkServiceConnections[0].privateLinkServiceConnectionState.status}" \
+                        -o table || echo "⚠️ Could not query PEs"
+
+                - task: AzureCLI@2
+                  displayName: 'Smoke Tests'
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    failOnStandardError: false
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo "╔══════════════════════════════════════════╗"
+                      echo "║     APIM SMOKE TESTS — PREPROD          ║"
+                      echo "╚══════════════════════════════════════════╝"
+
+                      APIM_NAME="scb-preprd-apim-eus2-apim-01"
+                      RG_NAME="scb-preprd-apim-eus2-rg-01"
+                      SUB_ID="$(PREPROD_SUBSCRIPTION_ID)"
+                      PASS=0
+                      WARN=0
+                      FAIL=0
+
+                      # Test 1: APIM provisioning state
+                      echo ""
+                      echo "▶ Test 1: APIM Provisioning State"
+                      STATUS=$(az apim show -n $APIM_NAME -g $RG_NAME --subscription $SUB_ID \
+                        --query provisioningState -o tsv 2>/dev/null || echo "error")
+                      if [ "$STATUS" = "Succeeded" ]; then
+                        echo "  ✅ PASS — APIM state: $STATUS"
+                        PASS=$((PASS+1))
+                      else
+                        echo "  ❌ FAIL — APIM state: $STATUS (expected: Succeeded)"
+                        FAIL=$((FAIL+1))
+                      fi
+
+                      # Test 2: Platform version is stv2
+                      echo ""
+                      echo "▶ Test 2: Platform Version"
+                      PLATFORM=$(az apim show -n $APIM_NAME -g $RG_NAME --subscription $SUB_ID \
+                        --query platformVersion -o tsv 2>/dev/null || echo "error")
+                      if [ "$PLATFORM" = "stv2" ] || [ "$PLATFORM" = "stv2.1" ]; then
+                        echo "  ✅ PASS — Platform: $PLATFORM"
+                        PASS=$((PASS+1))
+                      else
+                        echo "  ❌ FAIL — Platform: $PLATFORM (expected: stv2)"
+                        FAIL=$((FAIL+1))
+                      fi
+
+                      # Test 3: Private IP assigned
+                      echo ""
+                      echo "▶ Test 3: Private IP Assignment"
+                      PRIVATE_IP=$(az apim show -n $APIM_NAME -g $RG_NAME --subscription $SUB_ID \
+                        --query "privateIpAddresses[0]" -o tsv 2>/dev/null || echo "error")
+                      if [ -n "$PRIVATE_IP" ] && [ "$PRIVATE_IP" != "null" ] && [ "$PRIVATE_IP" != "error" ]; then
+                        echo "  ✅ PASS — Private IP: $PRIVATE_IP"
+                        PASS=$((PASS+1))
+                      else
+                        echo "  ❌ FAIL — No private IP assigned"
+                        FAIL=$((FAIL+1))
+                      fi
+
+                      # Test 4: Key Vault private endpoint
+                      echo ""
+                      echo "▶ Test 4: Key Vault Private Endpoint"
+                      KV_PE_STATUS=$(az network private-endpoint list -g $RG_NAME --subscription $SUB_ID \
+                        --query "[?contains(name,'kv')].privateLinkServiceConnections[0].privateLinkServiceConnectionState.status" \
+                        -o tsv 2>/dev/null || echo "error")
+                      if [ "$KV_PE_STATUS" = "Approved" ]; then
+                        echo "  ✅ PASS — KV PE: $KV_PE_STATUS"
+                        PASS=$((PASS+1))
+                      else
+                        echo "  ⚠️  WARN — KV PE: $KV_PE_STATUS"
+                        WARN=$((WARN+1))
+                      fi
+
+                      # Test 5: VNet peering
+                      echo ""
+                      echo "▶ Test 5: VNet Peering"
+                      PEERING_STATE=$(az network vnet peering list -g $RG_NAME \
+                        --vnet-name scb-preprd-apim-eus2-vnet-01 --subscription $SUB_ID \
+                        --query "[0].peeringState" -o tsv 2>/dev/null || echo "none")
+                      if [ "$PEERING_STATE" = "Connected" ]; then
+                        echo "  ✅ PASS — Peering: $PEERING_STATE"
+                        PASS=$((PASS+1))
+                      else
+                        echo "  ⚠️  WARN — Peering: $PEERING_STATE"
+                        WARN=$((WARN+1))
+                      fi
+
+                      echo ""
+                      echo "════════════════════════════════════════════"
+                      echo "  SMOKE TESTS COMPLETE"
+                      echo "  ✅ PASS: $PASS | ⚠️  WARN: $WARN | ❌ FAIL: $FAIL"
+                      echo "════════════════════════════════════════════"
+                      if [ $FAIL -gt 0 ]; then
+                        echo "❌ $FAIL critical test(s) failed — pipeline will stop"
+                        exit 1
+                      fi
+                      if [ $WARN -gt 0 ]; then
+                        echo "⚠️  $WARN warning(s) — non-critical, pipeline continues"
+                      fi
+                      echo "✅ All critical tests passed"
+
