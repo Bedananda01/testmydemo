@@ -139,6 +139,46 @@ stages:
             name: preprodCert
             inputs:
               secureFile: 'apim-stage.pfx'
+          # ====================================================================
+          # v v v TEMPORARY TASK TO FIX STATE FILE - REMOVE AFTER ONE RUN v v v
+          # This task initializes Terraform and imports the two existing
+          # resources into the remote state file.
+          # ====================================================================
+          - task: AzureCLI@2
+            displayName: 'TEMPORARY - One-Time Terraform Import Fix'
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              addSpnToEnvironment: true
+              failOnStandardError: false
+              workingDirectory: $(workingDir)
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                echo "--- Running one-time fix to import existing resources ---"
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(PREPROD_SUBSCRIPTION_ID)
+
+                echo "Initializing Terraform to connect to backend..."
+                terraform init \
+                  -backend-config=backend.tfvars \
+                  -backend-config="subscription_id=$(PREPROD_SUBSCRIPTION_ID)" \
+                  -backend-config="tenant_id=$tenantId" \
+                  -backend-config="client_id=$servicePrincipalId" \
+                  -backend-config="client_secret=$servicePrincipalKey"
+                
+                echo "Importing Key Vault Certificate..."
+                terraform import -input=false module.custom_domains.azurerm_key_vault_certificate.apim_cert "https://scb-preprd-eus2-kv-01.vault.azure.net/certificates/apim-9b72395dd8cfe"
+
+                echo "Importing Key Vault Key..."
+                terraform import -input=false module.storage.azurerm_key_vault_key.cmk "https://scb-kv-sa-cmk.vault.azure.net/keys/scbpreprdapimeus2sa01-cmk-540a67bab004"
+                
+                echo "--- One-time fix complete. Continuing to Plan step. ---"
+          # ====================================================================
+          # ^ ^ ^ END OF TEMPORARY TASK ^ ^ ^
+          # ====================================================================
 
           - task: AzureCLI@2
             displayName: 'Terraform Init & Plan'
@@ -601,4 +641,5 @@ stages:
                         echo "⚠️  $WARN warning(s) — non-critical, pipeline continues"
                       fi
                       echo "✅ All critical tests passed"
+
 
