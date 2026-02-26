@@ -139,46 +139,6 @@ stages:
             name: preprodCert
             inputs:
               secureFile: 'apim-stage.pfx'
-          # ====================================================================
-          # v v v TEMPORARY TASK TO FIX STATE FILE - REMOVE AFTER ONE RUN v v v
-          # This task initializes Terraform and imports the two existing
-          # resources into the remote state file.
-          # ====================================================================
-          - task: AzureCLI@2
-            displayName: 'TEMPORARY - One-Time Terraform Import Fix'
-            inputs:
-              azureSubscription: $(serviceConnection)
-              scriptType: bash
-              addSpnToEnvironment: true
-              failOnStandardError: false
-              workingDirectory: $(workingDir)
-              scriptLocation: inlineScript
-              inlineScript: |
-                set -euo pipefail
-                echo "--- Running one-time fix to import existing resources ---"
-                export ARM_CLIENT_ID=$servicePrincipalId
-                export ARM_CLIENT_SECRET=$servicePrincipalKey
-                export ARM_TENANT_ID=$tenantId
-                export ARM_SUBSCRIPTION_ID=$(PREPROD_SUBSCRIPTION_ID)
-
-                echo "Initializing Terraform to connect to backend..."
-                terraform init \
-                  -backend-config=backend.tfvars \
-                  -backend-config="subscription_id=$(PREPROD_SUBSCRIPTION_ID)" \
-                  -backend-config="tenant_id=$tenantId" \
-                  -backend-config="client_id=$servicePrincipalId" \
-                  -backend-config="client_secret=$servicePrincipalKey"
-                
-                echo "Importing Key Vault Certificate..."
-                terraform import -input=false module.custom_domains.azurerm_key_vault_certificate.apim_cert "https://scb-preprd-eus2-kv-01.vault.azure.net/certificates/apim-9b72395dd8cfe"
-
-                echo "Importing Key Vault Key..."
-                terraform import -input=false module.storage.azurerm_key_vault_key.cmk "https://scb-kv-sa-cmk.vault.azure.net/keys/scbpreprdapimeus2sa01-cmk-540a67bab004"
-                
-                echo "--- One-time fix complete. Continuing to Plan step. ---"
-          # ====================================================================
-          # ^ ^ ^ END OF TEMPORARY TASK ^ ^ ^
-          # ====================================================================
 
           - task: AzureCLI@2
             displayName: 'Terraform Init & Plan'
@@ -413,82 +373,75 @@ stages:
 
                       chmod -R +x .terraform/providers/ 2>/dev/null || true
 
-                      # ── TERRAFORM APPLY WITH AUTO-IMPORT RETRY ──
-                      # If apply fails with "already exists", extract IDs, import, retry.
+                        # ── Auto-Import Orphaned Role Assignments (409 prevention) ──
                       echo ""
                       echo "══════════════════════════════════════════════"
-                      echo "  TERRAFORM APPLY (attempt 1)"
+                      echo "  AUTO-IMPORT ORPHANED RESOURCES
+                      echo " CHECK FOR ORPHANED ROLE ASSIGNMENTS
                       echo "══════════════════════════════════════════════"
+                      
+                      try_import() {
+                        local TF_ADDR="$1"
+                        local AZURE_ID="$2"
+                        local LABEL="$3"
 
-                      set +e
-                      terraform apply -auto-approve -lock-timeout=300s \
-                        -var-file=terraform.tfvars 2>&1 | tee /tmp/tf_apply_output.txt
-                      TF_EXIT=${PIPESTATUS[0]}
-                      set -e
+                        if ! terraform state show "$TF_ADDR" &>/dev/null; then
+                          echo "⚠️ $LABEL -- already in state"
+                          return 0
+                        fi  
+                          echo "⚠️ $LABEL -not in state, importing..."
+                          terraform import -var-file=terraform.tfvars "$TF_ADDR" "$AZURE_ID" 2>&1 && \
+                          echo "Imported $LABEL" || \
+                          echo "Import skipped for $LABEL (may not exist in Azure yet)"
+                          }
 
-                      if [ $TF_EXIT -ne 0 ]; then
-                        echo ""
-                        echo "══════════════════════════════════════════════"
-                        echo "  APPLY FAILED — CHECKING FOR ORPHANED RESOURCES"
-                        echo "══════════════════════════════════════════════"
 
-                        # Parse "already exists" errors to extract Azure resource IDs
-                        ORPHAN_IDS=$(grep -oP 'with the ID "https://[^"]+"' /tmp/tf_apply_output.txt | \
-                          grep -oP 'https://[^"]+' || echo "")
+                      # 1. Certificate in APIM key vault
+                      try_import \
+                          "module.custom_domains.azurerm_key_vault_certificate.apim_cert" \
+                          "https://scb-preprd-eus2-kv-01.vault.azure.net/certificates/apim-stage" \
+                          "apim_cert (KV certificate)"
 
-                        # Map error context to Terraform resource addresses
-                        IMPORTED=0
-                        while IFS= read -r AZURE_ID; do
-                          [ -z "$AZURE_ID" ] && continue
-                          echo "  Found orphan: $AZURE_ID"
+                      #2. CMK Key in shared CMK vault (name has random suffix - discover it)
+                        CMK_KEY_ID=$(az keyvault key list \
+                          --vault-name scb-kv-sa-cmk \1
+                          --subscription 46175b17-22e3-4be2-9790-abe58f1a5e50 \
+                          --query "[?starts_with(name,'scbpreprd')].kid" -o tsv 2>/dev/null | head -1 || echo "")
+                        if [ -n "$CMK_KEY_ID"]; then
+                          # Strip version from key ID for import
+                          CMK_KEY_VERSIONLESS=$(echo "$CMK_KEY_ID" | sed 's|/[^/]*$||')
+                          try_import \
+                            "module.storage.azurerm_key_vault_key.cmk" \
+                            "$CMK_KEY_VERSIONLESS" \
+                            "CMK key (storage encryption)"
+                        else
+                          echo " CMK key not found in vault (may not exist yet)"
+                        fi  
+                      
+                      #-------------Role Assignments---------------
+                      # 3. Deployer Crypto Officer role assignment
+                      SPN_OID=$(az ad sp show --id $servicePrincipalId --query id -o tsv)
+                      CMK_SCOPE="/subscriptions/46175b17-22e3-4be2-9790-abe58f1a5e50/resourceGroups/scb-rg-mon-core-eus2/providers/Microsoft.KeyVault/vaults/scb-kv-sa-cmk"
+                      EXISTING_ROLE=$(az role assignment list \
+                         --assignee "$SPN_OID" \
+                         --role "Key Vault Crypto Officer" \
+                         --scope "$CMK_SCOPE" \
+                         --query "[0].id" -o tsv 2>/dev/null || echo "")
 
-                          TF_ADDR=""
-                          if echo "$AZURE_ID" | grep -q "/certificates/"; then
-                            TF_ADDR="module.custom_domains.azurerm_key_vault_certificate.apim_cert"
-                          elif echo "$AZURE_ID" | grep -q "/keys/"; then
-                            # Strip version suffix for key import
-                            AZURE_ID=$(echo "$AZURE_ID" | sed 's|/[0-9a-f]\{20,\}$||')
-                            TF_ADDR="module.storage.azurerm_key_vault_key.cmk"
-                          fi
-
-                          if [ -n "$TF_ADDR" ]; then
-                            echo "  Importing: $TF_ADDR <- $AZURE_ID"
-                            terraform import -var-file=terraform.tfvars \
-                              "$TF_ADDR" "$AZURE_ID" 2>&1 && IMPORTED=$((IMPORTED+1)) || \
-                              echo "  ⚠️ Import failed for $TF_ADDR"
-                          fi
-                        done <<< "$ORPHAN_IDS"
-
-                        # Also check role assignment
-                        if grep -q "RoleAssignmentExists" /tmp/tf_apply_output.txt; then
-                          SPN_OID=$(az ad sp show --id $servicePrincipalId --query id -o tsv)
-                          CMK_SCOPE="/subscriptions/46175b17-22e3-4be2-9790-abe58f1a5e50/resourceGroups/scb-rg-mon-core-eus2/providers/Microsoft.KeyVault/vaults/scb-kv-sa-cmk"
-                          EXISTING_ROLE=$(az role assignment list \
-                            --assignee "$SPN_OID" \
-                            --role "Key Vault Crypto Officer" \
-                            --scope "$CMK_SCOPE" \
-                            --query "[0].id" -o tsv 2>/dev/null || echo "")
-                          if [ -n "$EXISTING_ROLE" ] && [ "$EXISTING_ROLE" != "None" ]; then
-                            terraform import -var-file=terraform.tfvars \
-                              module.storage.azurerm_role_assignment.deployer_crypto_officer \
-                              "$EXISTING_ROLE" 2>&1 && IMPORTED=$((IMPORTED+1)) || true
-                          fi
+                        if [ -n "$EXISTING_ROLE" ] && [ "$EXISTING_ROLE" != "None" ]; then
+                          echo "Found orphaned role assignment — importing: $EXISTING_ROLE"
+                          try_import \
+                            "module.storage.azurerm_role_assignment.deployer_crypto_officer" \
+                            "$EXISTING_ROLE" \
+                            "deployer_crypto_officer"
                         fi
-
-                        if [ $IMPORTED -gt 0 ]; then
                           echo ""
                           echo "══════════════════════════════════════════════"
-                          echo "  TERRAFORM APPLY (attempt 2 — after import)"
+                          echo "  TERRAFORM APPLY 
                           echo "══════════════════════════════════════════════"
                           terraform apply -auto-approve -lock-timeout=300s \
                             -var-file=terraform.tfvars
-                        else
-                          echo "  No orphaned resources found to import — failing."
-                          cat /tmp/tf_apply_output.txt
-                          exit 1
-                        fi
-                      fi
-
+                     
                 - task: AzureCLI@2
                   displayName: '🔒 Remove Agent IP from Key Vault Firewall'
                   condition: always()
@@ -641,5 +594,4 @@ stages:
                         echo "⚠️  $WARN warning(s) — non-critical, pipeline continues"
                       fi
                       echo "✅ All critical tests passed"
-
 
