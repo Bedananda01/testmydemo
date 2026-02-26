@@ -63,7 +63,6 @@ stages:
         displayName: 'Format Check & Validate'
         steps:
           - checkout: self
-
           - script: |
               echo "═══════════════════════════════════════════"
               echo "  Branch:  $(Build.SourceBranch)"
@@ -74,6 +73,7 @@ stages:
               sudo unzip -o /tmp/terraform.zip -d /usr/local/bin/
               terraform version
             displayName: 'Install Terraform'
+
           - task: AzureCLI@2
             displayName: 'Terraform Format Check'
             inputs:
@@ -90,7 +90,7 @@ stages:
                   echo "Continuing — format issues are warnings, not blockers."
                 }
                 terraform fmt -check . || true
-
+                
           - task: AzureCLI@2
             displayName: 'Terraform Validate'
             inputs:
@@ -102,12 +102,10 @@ stages:
               scriptLocation: inlineScript
               inlineScript: |
                 set -euo pipefail
-
                 export ARM_CLIENT_ID=$servicePrincipalId
                 export ARM_CLIENT_SECRET=$servicePrincipalKey
                 export ARM_TENANT_ID=$tenantId
                 export ARM_SUBSCRIPTION_ID=$(PREPROD_SUBSCRIPTION_ID)
-
                 terraform init -backend=false
                 terraform validate
                 echo "✅ Terraform validation passed"
@@ -129,7 +127,6 @@ stages:
         displayName: 'Terraform Plan — PreProd'
         steps:
           - checkout: self
-
           - script: |
               curl -fsSL https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip -o /tmp/terraform.zip
               sudo unzip -o /tmp/terraform.zip -d /usr/local/bin/
@@ -151,37 +148,30 @@ stages:
               scriptLocation: inlineScript
               inlineScript: |
                 set -euo pipefail
-
                 export ARM_CLIENT_ID=$servicePrincipalId
                 export ARM_CLIENT_SECRET=$servicePrincipalKey
                 export ARM_TENANT_ID=$tenantId
                 export ARM_SUBSCRIPTION_ID=$(PREPROD_SUBSCRIPTION_ID)
                 export TF_VAR_certificate_base64=$(base64 -w 0 $(preprodCert.secureFilePath))
                 export TF_VAR_certificate_password="$(PREPROD_CERT_PASSWORD)"
-
                 
-
                 echo "══════════════════════════════════════════════"
                 echo "  TERRAFORM INIT"
                 echo "══════════════════════════════════════════════"
-                terraform init \
-                  -backend-config=backend.tfvars \
-                  -backend-config="subscription_id=$(PREPROD_SUBSCRIPTION_ID)" \
-                  -backend-config="tenant_id=$tenantId" \
-                  -backend-config="client_id=$servicePrincipalId" \
-                  -backend-config="client_secret=$servicePrincipalKey"
-
+                # CORRECTED COMMAND
+                terraform init -backend-config=backend.tfvars
+                
                 chmod -R +x .terraform/providers/ 2>/dev/null || true
-
                 echo ""
+
                 echo "══════════════════════════════════════════════"
                 echo "  TERRAFORM PLAN"
                 echo "══════════════════════════════════════════════"
                 terraform plan -lock-timeout=300s \
                   -var-file=terraform.tfvars \
                   -out=preprod.tfplan
-
                 echo ""
+
                 echo "══════════════════════════════════════════════"
                 echo "  ✅ Plan complete — review above output"
                 echo "══════════════════════════════════════════════"
@@ -246,12 +236,11 @@ stages:
                     azureSubscription: $(serviceConnection)
                     scriptType: bash
                     addSpnToEnvironment: true
-                    failOnStandardError: false
+                    failOnStandardError: true
                     workingDirectory: $(Pipeline.Workspace)/source-preprod/infra/environments/preprod
                     scriptLocation: inlineScript
                     inlineScript: |
                       set -euo pipefail
-
                       export ARM_CLIENT_ID=$servicePrincipalId
                       export ARM_CLIENT_SECRET=$servicePrincipalKey
                       export ARM_TENANT_ID=$tenantId
@@ -259,44 +248,21 @@ stages:
                       export TF_VAR_certificate_base64=$(base64 -w 0 $(preprodCert.secureFilePath))
                       export TF_VAR_certificate_password="$(PREPROD_CERT_PASSWORD)"
 
-                    
                       echo "══════════════════════════════════════════════"
                       echo "  TERRAFORM INIT"
                       echo "══════════════════════════════════════════════"
-                      terraform init \
-                        -backend-config=backend.tfvars \
-                        -backend-config="subscription_id=$(PREPROD_SUBSCRIPTION_ID)" \
-                        -backend-config="tenant_id=$tenantId" \
-                        -backend-config="client_id=$servicePrincipalId" \
-                        -backend-config="client_secret=$servicePrincipalKey"
-
+                      # CORRECTED COMMAND
+                      terraform init -backend-config=backend.tfvars
+                      
                       chmod -R +x .terraform/providers/ 2>/dev/null || true
+                      echo ""
 
-                    
-                        # Also check role assignment
-                        if grep -q "RoleAssignmentExists" /tmp/tf_apply_output.txt; then
-                          SPN_OID=$(az ad sp show --id $servicePrincipalId --query id -o tsv)
-                          CMK_SCOPE="/subscriptions/46175b17-22e3-4be2-9790-abe58f1a5e50/resourceGroups/scb-rg-mon-core-eus2/providers/Microsoft.KeyVault/vaults/scb-kv-sa-cmk"
-                          EXISTING_ROLE=$(az role assignment list \
-                            --assignee "$SPN_OID" \
-                            --role "Key Vault Crypto Officer" \
-                            --scope "$CMK_SCOPE" \
-                            --query "[0].id" -o tsv 2>/dev/null || echo "")
-                          if [ -n "$EXISTING_ROLE" ] && [ "$EXISTING_ROLE" != "None" ]; then
-                            terraform import -var-file=terraform.tfvars \
-                              module.storage.azurerm_role_assignment.deployer_crypto_officer \
-                              "$EXISTING_ROLE" 2>&1 && IMPORTED=$((IMPORTED+1)) || true
-                          fi
-                        fi
+                      echo "══════════════════════════════════════════════"
+                      echo "  TERRAFORM APPLY"
+                      echo "══════════════════════════════════════════════"
+                      # CORRECTED COMMAND - applies the saved plan
+                      terraform apply -auto-approve -lock-timeout=300s "$(Pipeline.Workspace)/preprod-plan/preprod.tfplan"
 
-                          echo ""
-                          echo "══════════════════════════════════════════════"
-                          echo "  TERRAFORM APPLY (attempt 2 — after import)"
-                          echo "══════════════════════════════════════════════"
-                          terraform apply -auto-approve -lock-timeout=300s \
-                            -var-file=terraform.tfvars
-                        
-                
                 - task: AzureCLI@2
                   displayName: 'Post-Deploy Validation'
                   inputs:
@@ -311,7 +277,6 @@ stages:
                         --subscription $(PREPROD_SUBSCRIPTION_ID) \
                         --query "{name:name, status:provisioningState, privateIP:privateIpAddresses[0]}" \
                         -o table || echo "⚠️ Could not query APIM status"
-
                       echo ""
                       echo "=== Private Endpoints ==="
                       az network private-endpoint list \
@@ -331,14 +296,13 @@ stages:
                       echo "╔══════════════════════════════════════════╗"
                       echo "║     APIM SMOKE TESTS — PREPROD          ║"
                       echo "╚══════════════════════════════════════════╝"
-
                       APIM_NAME="scb-preprd-apim-eus2-apim-01"
                       RG_NAME="scb-preprd-apim-eus2-rg-01"
                       SUB_ID="$(PREPROD_SUBSCRIPTION_ID)"
                       PASS=0
                       WARN=0
                       FAIL=0
-
+                      
                       # Test 1: APIM provisioning state
                       echo ""
                       echo "▶ Test 1: APIM Provisioning State"
@@ -351,7 +315,7 @@ stages:
                         echo "  ❌ FAIL — APIM state: $STATUS (expected: Succeeded)"
                         FAIL=$((FAIL+1))
                       fi
-
+                      
                       # Test 2: Platform version is stv2
                       echo ""
                       echo "▶ Test 2: Platform Version"
@@ -364,7 +328,7 @@ stages:
                         echo "  ❌ FAIL — Platform: $PLATFORM (expected: stv2)"
                         FAIL=$((FAIL+1))
                       fi
-
+                      
                       # Test 3: Private IP assigned
                       echo ""
                       echo "▶ Test 3: Private IP Assignment"
@@ -377,7 +341,7 @@ stages:
                         echo "  ❌ FAIL — No private IP assigned"
                         FAIL=$((FAIL+1))
                       fi
-
+                      
                       # Test 4: Key Vault private endpoint
                       echo ""
                       echo "▶ Test 4: Key Vault Private Endpoint"
@@ -391,7 +355,7 @@ stages:
                         echo "  ⚠️  WARN — KV PE: $KV_PE_STATUS"
                         WARN=$((WARN+1))
                       fi
-
+                      
                       # Test 5: VNet peering
                       echo ""
                       echo "▶ Test 5: VNet Peering"
@@ -405,7 +369,7 @@ stages:
                         echo "  ⚠️  WARN — Peering: $PEERING_STATE"
                         WARN=$((WARN+1))
                       fi
-
+                      
                       echo ""
                       echo "════════════════════════════════════════════"
                       echo "  SMOKE TESTS COMPLETE"
@@ -419,4 +383,3 @@ stages:
                         echo "⚠️  $WARN warning(s) — non-critical, pipeline continues"
                       fi
                       echo "✅ All critical tests passed"
-
