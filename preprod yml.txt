@@ -159,61 +159,7 @@ stages:
                 export TF_VAR_certificate_base64=$(base64 -w 0 $(preprodCert.secureFilePath))
                 export TF_VAR_certificate_password="$(PREPROD_CERT_PASSWORD)"
 
-                # ── Detect Agent IP & Whitelist in Key Vault ──
-                AGENT_IP=$(curl -s --retry 3 https://api.ipify.org)
-                echo "Pipeline agent public IP: $AGENT_IP"
-                export TF_VAR_deployer_ip="${AGENT_IP}/32"
-
-                # If KV already exists, enable public access with IP filter and add agent IP
-                KV_NAME="scb-preprd-eus2-kv-01"
-                KV_RG="scb-preprd-apim-eus2-rg-01"
-                if az keyvault show -n $KV_NAME -g $KV_RG --subscription $(PREPROD_SUBSCRIPTION_ID) &>/dev/null; then
-                  echo "Key Vault exists — ensuring public access enabled with firewall..."
-
-                  # Enable public access (required for IP rules to work)
-                  az keyvault update \
-                    --name $KV_NAME \
-                    --resource-group $KV_RG \
-                    --subscription $(PREPROD_SUBSCRIPTION_ID) \
-                    --public-network-access Enabled \
-                    --only-show-errors 2>/dev/null || echo "⚠️ Could not enable public access"
-
-                  # Ensure default action is Deny (only whitelisted IPs)
-                  az keyvault update \
-                    --name $KV_NAME \
-                    --resource-group $KV_RG \
-                    --subscription $(PREPROD_SUBSCRIPTION_ID) \
-                    --default-action Deny \
-                    --bypass AzureServices \
-                    --only-show-errors 2>/dev/null || true
-
-                  # Add pipeline agent IP to firewall
-                  az keyvault network-rule add \
-                    --name $KV_NAME \
-                    --resource-group $KV_RG \
-                    --subscription $(PREPROD_SUBSCRIPTION_ID) \
-                    --ip-address "${AGENT_IP}/32" \
-                    --only-show-errors 2>/dev/null || echo "⚠️ Could not add IP rule (may already exist)"
-                  echo "Waiting 30s for firewall changes to propagate..."
-                  sleep 30
-                else
-                  echo "Key Vault does not exist yet — will be created by Terraform with agent IP in firewall."
-                fi
-
-                #--- Also whitelist on CMK Key Vault ---
-                CMK_KV_NAME="scb-kv-sa-cmk"
-                CMK_KV_RG="scb-rg-mon-core-eus2"
-                CMK_KV_SUB="46175b17-22e3-4be2-9790-abe58f1a5e50"
-                if az keyvault show -n$CMK_KV_NAME -g $CMK_KV_RG --subscription $CMK_KV_SUB &>/dev/null; then
-                   echo "CMK Key Vault - adding agent IP ..."
-                   az keyvault network-rule add \
-                     --name $CMK_KV_NAME \
-                     --resource-group $CMK_KV_RG \
-                     --subscription $CMK_KV_SUB \
-                     --ip-address "${AGENT_IP}/32" \
-                     --only-show-errors 2>/dev/null || echo "Could not add CMK KV IP rule"
-                    sleep 15
-                  fi
+                
 
                 echo "══════════════════════════════════════════════"
                 echo "  TERRAFORM INIT"
@@ -313,54 +259,7 @@ stages:
                       export TF_VAR_certificate_base64=$(base64 -w 0 $(preprodCert.secureFilePath))
                       export TF_VAR_certificate_password="$(PREPROD_CERT_PASSWORD)"
 
-                      # ── Detect Agent IP & Whitelist in Key Vault ──
-                      AGENT_IP=$(curl -s --retry 3 https://api.ipify.org)
-                      echo "Pipeline agent public IP: $AGENT_IP"
-                      export TF_VAR_deployer_ip="${AGENT_IP}/32"
-
-                      KV_NAME="scb-preprd-eus2-kv-01"
-                      KV_RG="scb-preprd-apim-eus2-rg-01"
-                      if az keyvault show -n $KV_NAME -g $KV_RG --subscription $(PREPROD_SUBSCRIPTION_ID) &>/dev/null; then
-                        echo "Key Vault exists — ensuring public access enabled with firewall..."
-                        az keyvault update \
-                          --name $KV_NAME \
-                          --resource-group $KV_RG \
-                          --subscription $(PREPROD_SUBSCRIPTION_ID) \
-                          --public-network-access Enabled \
-                          --only-show-errors 2>/dev/null || echo "⚠️ Could not enable public access"
-                        az keyvault update \
-                          --name $KV_NAME \
-                          --resource-group $KV_RG \
-                          --subscription $(PREPROD_SUBSCRIPTION_ID) \
-                          --default-action Deny \
-                          --bypass AzureServices \
-                          --only-show-errors 2>/dev/null || true
-                        az keyvault network-rule add \
-                          --name $KV_NAME \
-                          --resource-group $KV_RG \
-                          --subscription $(PREPROD_SUBSCRIPTION_ID) \
-                          --ip-address "${AGENT_IP}/32" \
-                          --only-show-errors 2>/dev/null || echo "⚠️ Could not add IP rule (may already exist)"
-                        echo "Waiting 30s for firewall changes to propagate..."
-                        sleep 30
-                      fi
-
-                      #--------- Alos whitelist on CMK Key Vault (shared vault for storage encryption) ---
-                      CMK_KV_NAME="scb-kv-sa-cmk"
-                      CMK_KV_RG="scb-rg-mon-core-eus2"
-                      CMK_KV_SUB="46175b17-22e3-4be2-9790-abe58f1a5e50"
-                      if az keyvault show -n$CMK_KV_NAME -g $CMK_KV_RG --subscription $CMK_KV_SUB &>/dev/null; then
-                        echo "CMK Key Vault - adding agent IP ..."
-                        az keyvault network-rule add \
-                          --name $CMK_KV_NAME \
-                          --resource-group $CMK_KV_RG \
-                          --subscription $CMK_KV_SUB \
-                          --ip-address "${AGENT_IP}/32" \
-                          --only-show-errors 2>/dev/null || echo "Could not add CMK KV IP rule"
-                          sleep 15
-                        fi
-
-
+                    
                       echo "══════════════════════════════════════════════"
                       echo "  TERRAFORM INIT"
                       echo "══════════════════════════════════════════════"
@@ -373,105 +272,31 @@ stages:
 
                       chmod -R +x .terraform/providers/ 2>/dev/null || true
 
-                        # ── Auto-Import Orphaned Role Assignments (409 prevention) ──
-                      echo ""
-                      echo "══════════════════════════════════════════════"
-                      echo "  AUTO-IMPORT ORPHANED RESOURCES
-                      echo " CHECK FOR ORPHANED ROLE ASSIGNMENTS
-                      echo "══════════════════════════════════════════════"
-                      
-                      try_import() {
-                        local TF_ADDR="$1"
-                        local AZURE_ID="$2"
-                        local LABEL="$3"
-
-                        if ! terraform state show "$TF_ADDR" &>/dev/null; then
-                          echo "⚠️ $LABEL -- already in state"
-                          return 0
-                        fi  
-                          echo "⚠️ $LABEL -not in state, importing..."
-                          terraform import -var-file=terraform.tfvars "$TF_ADDR" "$AZURE_ID" 2>&1 && \
-                          echo "Imported $LABEL" || \
-                          echo "Import skipped for $LABEL (may not exist in Azure yet)"
-                          }
-
-
-                      # 1. Certificate in APIM key vault
-                      try_import \
-                          "module.custom_domains.azurerm_key_vault_certificate.apim_cert" \
-                          "https://scb-preprd-eus2-kv-01.vault.azure.net/certificates/apim-stage" \
-                          "apim_cert (KV certificate)"
-
-                      #2. CMK Key in shared CMK vault (name has random suffix - discover it)
-                        CMK_KEY_ID=$(az keyvault key list \
-                          --vault-name scb-kv-sa-cmk \1
-                          --subscription 46175b17-22e3-4be2-9790-abe58f1a5e50 \
-                          --query "[?starts_with(name,'scbpreprd')].kid" -o tsv 2>/dev/null | head -1 || echo "")
-                        if [ -n "$CMK_KEY_ID"]; then
-                          # Strip version from key ID for import
-                          CMK_KEY_VERSIONLESS=$(echo "$CMK_KEY_ID" | sed 's|/[^/]*$||')
-                          try_import \
-                            "module.storage.azurerm_key_vault_key.cmk" \
-                            "$CMK_KEY_VERSIONLESS" \
-                            "CMK key (storage encryption)"
-                        else
-                          echo " CMK key not found in vault (may not exist yet)"
-                        fi  
-                      
-                      #-------------Role Assignments---------------
-                      # 3. Deployer Crypto Officer role assignment
-                      SPN_OID=$(az ad sp show --id $servicePrincipalId --query id -o tsv)
-                      CMK_SCOPE="/subscriptions/46175b17-22e3-4be2-9790-abe58f1a5e50/resourceGroups/scb-rg-mon-core-eus2/providers/Microsoft.KeyVault/vaults/scb-kv-sa-cmk"
-                      EXISTING_ROLE=$(az role assignment list \
-                         --assignee "$SPN_OID" \
-                         --role "Key Vault Crypto Officer" \
-                         --scope "$CMK_SCOPE" \
-                         --query "[0].id" -o tsv 2>/dev/null || echo "")
-
-                        if [ -n "$EXISTING_ROLE" ] && [ "$EXISTING_ROLE" != "None" ]; then
-                          echo "Found orphaned role assignment — importing: $EXISTING_ROLE"
-                          try_import \
-                            "module.storage.azurerm_role_assignment.deployer_crypto_officer" \
-                            "$EXISTING_ROLE" \
-                            "deployer_crypto_officer"
+                    
+                        # Also check role assignment
+                        if grep -q "RoleAssignmentExists" /tmp/tf_apply_output.txt; then
+                          SPN_OID=$(az ad sp show --id $servicePrincipalId --query id -o tsv)
+                          CMK_SCOPE="/subscriptions/46175b17-22e3-4be2-9790-abe58f1a5e50/resourceGroups/scb-rg-mon-core-eus2/providers/Microsoft.KeyVault/vaults/scb-kv-sa-cmk"
+                          EXISTING_ROLE=$(az role assignment list \
+                            --assignee "$SPN_OID" \
+                            --role "Key Vault Crypto Officer" \
+                            --scope "$CMK_SCOPE" \
+                            --query "[0].id" -o tsv 2>/dev/null || echo "")
+                          if [ -n "$EXISTING_ROLE" ] && [ "$EXISTING_ROLE" != "None" ]; then
+                            terraform import -var-file=terraform.tfvars \
+                              module.storage.azurerm_role_assignment.deployer_crypto_officer \
+                              "$EXISTING_ROLE" 2>&1 && IMPORTED=$((IMPORTED+1)) || true
+                          fi
                         fi
+
                           echo ""
                           echo "══════════════════════════════════════════════"
-                          echo "  TERRAFORM APPLY 
+                          echo "  TERRAFORM APPLY (attempt 2 — after import)"
                           echo "══════════════════════════════════════════════"
                           terraform apply -auto-approve -lock-timeout=300s \
                             -var-file=terraform.tfvars
-                     
-                - task: AzureCLI@2
-                  displayName: '🔒 Remove Agent IP from Key Vault Firewall'
-                  condition: always()
-                  inputs:
-                    azureSubscription: $(serviceConnection)
-                    scriptType: bash
-                    failOnStandardError: false
-                    scriptLocation: inlineScript
-                    inlineScript: |
-                      AGENT_IP=$(curl -s --retry 3 https://api.ipify.org)
-                      KV_NAME="scb-preprd-eus2-kv-01"
-                      KV_RG="scb-preprd-apim-eus2-rg-01"
-
-                      echo "Removing agent IP ${AGENT_IP} from Key Vault firewalls..."
-                      az keyvault network-rule remove \
-                        --name $KV_NAME \
-                        --resource-group $KV_RG \
-                        --subscription $(PREPROD_SUBSCRIPTION_ID) \
-                        --ip-address "${AGENT_IP}/32" \
-                        --only-show-errors 2>/dev/null || echo "⚠️ Could not remove IP from APIM KV"
-
-                      # Also clean up CMK vault
-                      az keyvault network-rule remove \
-                        --name scb-kv-sa-cmk \
-                        --resource-group scb-rg-mon-core-eus2 \
-                        --subscription 46175b17-22e3-4be2-9790-abe58f1a5e50 \
-                        --ip-address "${AGENT_IP}/32" \
-                        --only-show-errors 2>/dev/null || echo "⚠️ Could not remove IP from CMK KV"
-                      echo "✅ Agent IP removed — Key Vaults locked down"
-
+                        
+                
                 - task: AzureCLI@2
                   displayName: 'Post-Deploy Validation'
                   inputs:
