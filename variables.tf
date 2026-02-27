@@ -123,7 +123,7 @@ stages:
               secureFile: 'apim-stage.pfx'
 
           - task: AzureCLI@2
-            displayName: 'Terraform Init & Plan'
+            displayName: 'Terraform Init, Import & Plan (ONE-TIME-FIX)'
             inputs:
               azureSubscription: $(serviceConnection)
               scriptType: bash
@@ -139,66 +139,34 @@ stages:
                 export ARM_SUBSCRIPTION_ID=$(PREPROD_SUBSCRIPTION_ID)
                 export TF_VAR_certificate_base64=$(base64 -w 0 $(preprodCert.secureFilePath))
                 export TF_VAR_certificate_password="$(PREPROD_CERT_PASSWORD)"
-                
+
                 echo "══════════════════════════════════════════════"
-                echo "  TERRAFORM INIT"
+                echo "  1. TERRAFORM INIT"
                 echo "══════════════════════════════════════════════"
                 terraform init -backend-config=backend.tfvars
 
-          - task: AzureCLI@2
-            displayName: 'ONE-TIME-FIX: Import Existing Resources'
-            inputs:
-              azureSubscription: $(serviceConnection)
-              scriptType: bash
-              addSpnToEnvironment: true
-              failOnStandardError: false
-              workingDirectory: $(workingDir)
-              scriptLocation: inlineScript
-              inlineScript: |
-                set -euo pipefail
-                export ARM_CLIENT_ID=$servicePrincipalId
-                export ARM_CLIENT_SECRET=$servicePrincipalKey
-                export ARM_TENANT_ID=$tenantId
-                export ARM_SUBSCRIPTION_ID=$(PREPROD_SUBSCRIPTION_ID)
-
+                echo ""
                 echo "══════════════════════════════════════════════"
-                echo "  Attempting to import certificate..."
+                echo "  2. IMPORTING RESOURCES (ONE-TIME-FIX)"
                 echo "══════════════════════════════════════════════"
+                
                 TF_CERT_ADDRESS='module.custom_domains.azurerm_key_vault_certificate.apim_cert'
                 AZURE_CERT_ID='https://scb-preprd-eus2-kv-01.vault.azure.net/certificates/apim-stage'
-                terraform import "${TF_CERT_ADDRESS}" "${AZURE_CERT_ID}" || echo "Certificate may already be in state. Continuing..."
+                terraform import "${TF_CERT_ADDRESS}" "${AZURE_CERT_ID}" || echo "--> Certificate may already be in state. Continuing..."
+
+                TF_KEY_ADDRESS='module.storage.azurerm_key_vault_key.cmk'
+                AZURE_KEY_ID='https://scb-kv-sa-cmk.vault.azure.net/keys/scbpreprdapimeus2sa01-cmk-7690'
+                terraform import "${TF_KEY_ADDRESS}" "${AZURE_KEY_ID}" || echo "--> Key may already be in state. Continuing..."
 
                 echo ""
                 echo "══════════════════════════════════════════════"
-                echo "  Attempting to import key..."
-                echo "══════════════════════════════════════════════"
-                TF_KEY_ADDRESS='module.storage.azurerm_key_vault_key.cmk'
-                AZURE_KEY_ID='https://scb-kv-sa-cmk.vault.azure.net/keys/scbpreprdapimeus2sa01-cmk-7690'
-                terraform import "${TF_KEY_ADDRESS}" "${AZURE_KEY_ID}" || echo "Key may already be in state. Continuing..."
-          
-          - task: AzureCLI@2
-            displayName: 'Terraform Plan'
-            inputs:
-              azureSubscription: $(serviceConnection)
-              scriptType: bash
-              addSpnToEnvironment: true
-              failOnStandardError: true
-              workingDirectory: $(workingDir)
-              scriptLocation: inlineScript
-              inlineScript: |
-                set -euo pipefail
-                export ARM_CLIENT_ID=$servicePrincipalId
-                export ARM_CLIENT_SECRET=$servicePrincipalKey
-                export ARM_TENANT_ID=$tenantId
-                export ARM_SUBSCRIPTION_ID=$(PREPROD_SUBSCRIPTION_ID)
-
-                echo "══════════════════════════════════════════════"
-                echo "  TERRAFORM PLAN"
+                echo "  3. TERRAFORM PLAN"
                 echo "══════════════════════════════════════════════"
                 terraform plan -lock-timeout=300s \
                   -var-file=terraform.tfvars \
                   -out=preprod.tfplan
-                echo "✅ Plan complete."
+                
+                echo "✅ Init, Import, and Plan complete."
 
           - task: PublishPipelineArtifact@1
             displayName: 'Publish Plan'
