@@ -1,53 +1,27 @@
-terraform {
-  required_providers {
-    azurerm = {
-      source  = "hashicorp/azurerm"
-      version = "~>3.0"
-    }
-  }
-}
+during the import i see two erro-
 
-provider "azurerm" {
-  features {}
-}
+1-╷
+│ Error: Cannot import non-existent remote object
+│ 
+│ While attempting to import an existing object to
+│ "module.storage.azurerm_key_vault_key.cmk", the provider detected that no
+│ object exists with the given id. Only pre-existing objects can be imported;
+│ check that the id is correct and that it is associated with the provider's
+│ configured region or endpoint, or use "terraform apply" to create a new
+│ remote object for this resource.
+╵
 
-# Look up the existing resource group
-data "azurerm_resource_group" "existing" {
-  name = var.existing_resource_group_name
-}
+✅ CMK import attempted (non-fatal).
+✅ Role assignment already tracked in state. Skipping import.
 
-# Local variables for naming
-locals {
-  apim_name    = "${var.project_name}-${var.environment}-apim"
-  product_id   = lower(replace(var.product_name, " ", "-"))
-  api_name     = lower(replace(var.api_display_name, " ", "-"))
-}
 
-# Deploy the APIM instance using the apim module
-module "apim" {
- source = "./modules/apim"
+2-╷
+│ Error: a resource with the ID "https://scb-kv-sa-cmk.vault.azure.net/keys/scbpreprdapimeus2sa01-cmk-7690/6fc89e0f7e7f449da1b7540a67bab004" already exists - to be managed via Terraform this resource needs to be imported into the State. Please see the resource documentation for "azurerm_key_vault_key" for more information
+│ 
+│   with module.storage.azurerm_key_vault_key.cmk,
+│   on ../../modules/storage/main.tf line 50, in resource "azurerm_key_vault_key" "cmk":
+│   50: resource "azurerm_key_vault_key" "cmk" {
+│ 
+╵
 
-  resource_group_name = data.azurerm_resource_group.existing.name
-  location            = data.azurerm_resource_gSroup.existing.location
-  apim_name           = local.apim_name
-  publisher_name      = var.apim_publisher_name
-  publisher_email     = var.apim_publisher_email
-  sku_name            = var.apim_sku_name
-}
-
-module "api_config" {
-  source = "./modules/api_config"
-
-  # Pass in values from the APIM instance and root variables
-  api_management_name = module.apim.apim_name
-  resource_group_name = data.azurerm_resource_group.existing.name
-
-  # API configuration
-  api_name             = local.api_name
-  api_display_name     = var.api_display_name
-  backend_api_base_url = var.backend_api_base_url
-
-  # Product and Policy configuration
-  product_id   = local.product_id
-  product_name = var.product_name
-}
+##[error]Script failed with exit code: 1
