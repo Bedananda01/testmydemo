@@ -1,8 +1,9 @@
 ###############################################################################
 # Azure DevOps Pipeline — SCB APIM Infrastructure (PREPROD)
 #
-# This pipeline handles the PreProd environment ONLY.
-# Triggered by: develop branch pushes + PRs targeting develop
+# This pipeline contains a ONE-TIME FIX to import existing resources.
+# After this pipeline succeeds, the 'Terraform Init, Import & Plan'
+# task should be simplified to remove the import commands.
 #
 ###############################################################################
 
@@ -96,10 +97,10 @@ stages:
                 echo "✅ Terraform validation passed"
 
 ###############################################################################
-# Stage 2: PLAN — develop branch only (not PRs, not feature branches)
+# Stage 2: PLAN (with ONE-TIME-FIX)
 ###############################################################################
   - stage: Plan_PreProd
-    displayName: '📋 Plan PreProd'
+    displayName: '📋 Plan PreProd (with ONE-TIME-FIX)'
     dependsOn: Validate
     condition: |
       and(
@@ -123,7 +124,7 @@ stages:
               secureFile: 'apim-stage.pfx'
 
           - task: AzureCLI@2
-            displayName: 'Terraform Init, Import & Plan (ONE-TIME-FIX)'
+            displayName: 'Terraform: Init, Import & Plan (ONE-TIME-FIX)'
             inputs:
               azureSubscription: $(serviceConnection)
               scriptType: bash
@@ -143,7 +144,12 @@ stages:
                 echo "══════════════════════════════════════════════"
                 echo "  1. TERRAFORM INIT"
                 echo "══════════════════════════════════════════════"
-                terraform init -backend-config=backend.tfvars
+                terraform init \
+                  -backend-config=backend.tfvars \
+                  -backend-config="subscription_id=$(PREPROD_SUBSCRIPTION_ID)" \
+                  -backend-config="tenant_id=$tenantId" \
+                  -backend-config="client_id=$servicePrincipalId" \
+                  -backend-config="client_secret=$servicePrincipalKey"
 
                 echo ""
                 echo "══════════════════════════════════════════════"
@@ -152,11 +158,11 @@ stages:
                 
                 TF_CERT_ADDRESS='module.custom_domains.azurerm_key_vault_certificate.apim_cert'
                 AZURE_CERT_ID='https://scb-preprd-eus2-kv-01.vault.azure.net/certificates/apim-stage'
-                terraform import "${TF_CERT_ADDRESS}" "${AZURE_CERT_ID}" || echo "--> Certificate may already be in state. Continuing..."
+                terraform import "${TF_CERT_ADDRESS}" "${AZURE_CERT_ID}" || echo "--> WARNING: Certificate import failed. It might already be in state."
 
                 TF_KEY_ADDRESS='module.storage.azurerm_key_vault_key.cmk'
                 AZURE_KEY_ID='https://scb-kv-sa-cmk.vault.azure.net/keys/scbpreprdapimeus2sa01-cmk-7690'
-                terraform import "${TF_KEY_ADDRESS}" "${AZURE_KEY_ID}" || echo "--> Key may already be in state. Continuing..."
+                terraform import "${TF_KEY_ADDRESS}" "${AZURE_KEY_ID}" || echo "--> WARNING: Key import failed. It might already be in state."
 
                 echo ""
                 echo "══════════════════════════════════════════════"
@@ -243,7 +249,12 @@ stages:
                       echo "══════════════════════════════════════════════"
                       echo "  TERRAFORM INIT"
                       echo "══════════════════════════════════════════════"
-                      terraform init -backend-config=backend.tfvars
+                      terraform init \
+                        -backend-config=backend.tfvars \
+                        -backend-config="subscription_id=$(PREPROD_SUBSCRIPTION_ID)" \
+                        -backend-config="tenant_id=$tenantId" \
+                        -backend-config="client_id=$servicePrincipalId" \
+                        -backend-config="client_secret=$servicePrincipalKey"
 
                       echo "══════════════════════════════════════════════"
                       echo "  TERRAFORM APPLY"
