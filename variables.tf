@@ -1,3 +1,24 @@
+error
+To perform exactly these actions, run the following command to apply:
+    terraform apply "preprod.tfplan"
+✅ Init, Import, and Plan complete.
+
+##[error]╷
+│ Error: expected a key vault versioned ID but no version information was found in: "https://scb-preprd-eus2-kv-01.vault.azure.net/certificates/apim-stage"
+│ 
+│ 
+╵
+
+╷
+│ Error: expected a key vault versioned ID but no version information was found in: "https://scb-kv-sa-cmk.vault.azure.net/keys/scbpreprdapimeus2sa01-cmk-7690"
+│ 
+│ 
+##[error]Script has output to stderr. Failing as failOnStdErr is set to true.
+/usr/bin/az account clear
+Finishing: Terraform Init, Import & Plan (ONE-TIME-FIX)
+
+
+yml
 ###############################################################################
 # Azure DevOps Pipeline — SCB APIM Infrastructure (PREPROD)
 #
